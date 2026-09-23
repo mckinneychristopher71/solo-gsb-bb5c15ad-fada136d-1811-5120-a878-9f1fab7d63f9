@@ -204,6 +204,98 @@ RFC 6901 路径字符串排序并对齐两侧叶子：
 文档时（例如以相同值 `replace`），`changedPaths` 为空数组；`operations` 为空数组
 时原样返回文档且 `changedPaths` 为 `[]`。
 
+### 8b. 带回滚操作的补丁（`POST /patch/undo`）
+
+`/patch/undo` 接收与 `/patch` **完全相同**的 `{document, operations}` 请求，执行同样的
+两遍校验与按序应用，成功时返回 `document`、`changedPaths`（与 `/patch` 一致）**外加**
+`undoOperations`：一组可直接作为 `/patch` 的 `operations` 使用的回滚操作。
+
+服务在**逐步执行每一个正向操作之前**记录该步目标位置的状态，并把各步的逆操作按
+**反序**输出（最后执行的操作最先回滚，因此先回滚的步骤不会改变后续逆操作里记录的下标）：
+
+| 正向操作 | 记录的逆操作 |
+| --- | --- |
+| 对象 `add` 新成员 | `remove` 该成员 |
+| 对象 `add` **已有键** | `replace` 回该键的**旧值**（不是删除） |
+| 对象 `remove` | `add` 回原成员名与原值 |
+| 对象 `replace` | `replace` 回旧值 |
+| 数组 `add`（数字下标插入或 `length` 追加） | `remove` 实际插入位置的**数字下标** |
+| 数组 `add`（`-` 末尾记号） | `remove` 追加后的实际数字下标（逆操作中**永远不会出现 `-`**） |
+| 数组 `remove` | `add` 回原下标与原值（元素随插入回到原位） |
+| 数组 `replace` | `replace` 回旧元素 |
+| 根路径 `""` 的 `add`/`replace` | `replace` `""` 为**该步执行前的整份旧文档** |
+
+将响应中的 `undoOperations` 连同 `document` 原样提交回 `/patch`，即：
+`POST /patch {"document": <响应的 document>, "operations": <响应的 undoOperations>}`，
+得到的文档与最初提交的 `document` 规范相等。`operations` 为空数组时 `undoOperations`
+也是 `[]`。
+
+任一步失败时行为与 `/patch` 完全一致：错误 `loc` 定位到 `operations[i]`（或
+`.op`/`.path`/`.value`），响应**不包含** `document`、`changedPaths` 或
+`undoOperations`，不产生部分结果。
+
+请求（沿用 §8 的示例）：
+
+```json
+{
+  "document": {
+    "subject": { "name": "Ada", "age": 36 },
+    "emails": ["ada@example.com"],
+    "role": null
+  },
+  "operations": [
+    { "op": "replace", "path": "/subject/age", "value": 37 },
+    { "op": "add", "path": "/emails/-", "value": "ada@analytical.engine" },
+    { "op": "add", "path": "/subject/title", "value": "Countess" },
+    { "op": "remove", "path": "/role" }
+  ]
+}
+```
+
+成功（`200`；逆操作按反序排列：数组 `-` 追加变成删除数字下标 `/emails/1`）：
+
+```json
+{
+  "document": {
+    "subject": { "name": "Ada", "age": 37, "title": "Countess" },
+    "emails": ["ada@example.com", "ada@analytical.engine"]
+  },
+  "changedPaths": [
+    "/emails/1",
+    "/role",
+    "/subject/age",
+    "/subject/title"
+  ],
+  "undoOperations": [
+    { "op": "add", "path": "/role", "value": null },
+    { "op": "remove", "path": "/subject/title" },
+    { "op": "remove", "path": "/emails/1" },
+    { "op": "replace", "path": "/subject/age", "value": 36 }
+  ]
+}
+```
+
+把 `undoOperations` 回放到修改后的文档即可完整回滚：
+
+```bash
+# 1) 打补丁并拿到回滚操作
+curl -s localhost:8000/patch/undo -H 'content-type: application/json' -d '{
+  "document": {"xs": ["a", "b"], "k": 1},
+  "operations": [
+    {"op": "add", "path": "/xs/-", "value": "c"},
+    {"op": "add", "path": "/k", "value": 2}
+  ]
+}' > /tmp/patched.json
+
+# /tmp/patched.json 的 undoOperations 为：
+# [ {"op":"replace","path":"/k","value":1},
+#   {"op":"remove","path":"/xs/2"} ]
+
+# 2) 交给 /patch 回滚 -> 还原为 {"xs":["a","b"],"k":1}
+jq '{document: .document, operations: .undoOperations}' /tmp/patched.json \
+  | curl -s localhost:8000/patch -H 'content-type: application/json' -d @-
+```
+
 ### 9. 确定性叶级脱敏（`POST /redact`）
 
 `/redact` 接收一份 `document` 与按数组顺序排列的 `rules`，在文档的**深拷贝**上对每个
@@ -605,6 +697,57 @@ array       0x17 || u32be(元素数) || 子节点哈希*                  （保
 } }
 ```
 
+### `POST /patch/undo` — 打补丁并返回可回放的回滚操作
+
+请求体与 `/patch` 完全相同（`document` + `operations`），成功响应在
+`document`、`changedPaths` 之外多出 `undoOperations`：每一步正向操作的逆操作，按
+**反序**排列、可直接作为 `/patch` 的 `operations` 回放到修改后的文档上，还原原文档。
+数组 `add`（含 `-`）一律按**实际数字下标** `remove` 撤销；对象已有键的 `add` 以
+`replace` 恢复旧值；根路径覆盖以空指针 `replace` 还原旧文档。
+
+请求：
+
+```json
+{
+  "document": {"xs": ["a", "b"], "k": 1},
+  "operations": [
+    {"op": "add", "path": "/xs/-", "value": "c"},
+    {"op": "add", "path": "/k", "value": 2}
+  ]
+}
+```
+
+成功（`200`）：
+
+```json
+{
+  "document": {"xs": ["a", "b", "c"], "k": 2},
+  "changedPaths": ["/k", "/xs/2"],
+  "undoOperations": [
+    {"op": "replace", "path": "/k", "value": 1},
+    {"op": "remove", "path": "/xs/2"}
+  ]
+}
+```
+
+回滚验证（把返回的 `document` 与 `undoOperations` 原样交给 `/patch`）：
+
+```bash
+curl -s localhost:8000/patch/undo -H 'content-type: application/json' -d '{
+  "document": {"xs": ["a", "b"], "k": 1},
+  "operations": [
+    {"op": "add", "path": "/xs/-", "value": "c"},
+    {"op": "add", "path": "/k", "value": 2}
+  ]
+}' | jq '{document: .document, operations: .undoOperations}' \
+  | curl -s localhost:8000/patch -H 'content-type: application/json' -d @-
+# => {"document": {"xs": ["a", "b"], "k": 1}, "changedPaths": ["/k", "/xs/2"]}
+```
+
+任一步失败时与 `/patch` 同构：返回相同的错误 `code` 与 `loc=operations[i]`，且不返回
+`document`/`undoOperations` 等任何部分结果。完整逆操作规则见上文
+[§8b](#8b-带回滚操作的补丁post-patchundo)。
+
 ### `POST /verify` — 无原文校验
 
 请求体只需提交方给你的根与所选披露：
@@ -747,6 +890,7 @@ array       0x17 || u32be(元素数) || 子节点哈希*                  （保
 - `GET /healthz` → `{"status":"ok"}`
 - `POST /diff` → 叶级 added/removed/changed 变更报告
 - `POST /patch` → 顺序执行 RFC 6902 add/remove/replace 补丁，返回 patched 文档与 changedPaths
+- `POST /patch/undo` → 同 /patch 请求，额外返回反序的 undoOperations，回放到 /patch 即还原原文档
 - `POST /redact` → 按 RFC 6901 片段（字面量/`*`/`**`）确定性 mask/drop 叶路径，返回 redacted 文档与 applied 列表
 - `POST /shape` → 不含叶值的结构清单（路径+类型）与自底向上同形哈希 `shapeHash`
 - `POST /merge` → base/left/right 三路合并：对象成员递归、数组整体取值、规范值相等、冲突按 RFC 6901 路径排序并给出三侧存在标记与值
@@ -784,6 +928,19 @@ curl -s localhost:8000/patch -H 'content-type: application/json' -d '{
     {"op": "remove", "path": "/subject/name"}
   ]
 }'
+
+# 4c) 同样的请求打向 /patch/undo，额外拿到反序的 undoOperations；
+#     再把它交给 /patch 即可回滚到原文档
+curl -s localhost:8000/patch/undo -H 'content-type: application/json' -d '{
+  "document": {"xs": ["a", "b"], "k": 1},
+  "operations": [
+    {"op": "add", "path": "/xs/-", "value": "c"},
+    {"op": "add", "path": "/k", "value": 2}
+  ]
+}' | tee /tmp/patched.json \
+  | jq '{document: .document, operations: .undoOperations}' \
+  | curl -s localhost:8000/patch -H 'content-type: application/json' -d @-
+# => {"document": {"xs": ["a", "b"], "k": 1}, ...} 原文档被还原
 
 # 5) 紧凑多叶证明：加 "proofMode": "compact"，返回 leafCount、
 #    每个叶的 index，以及按 (level,index) 去重的 proofNodes
@@ -839,7 +996,7 @@ app/
   main.py        # FastAPI 路由：/commit、/verify、/diff、/patch、/redact、/shape、/merge、错误处理
   diff.py        # 叶级路径对齐、规范值指纹与 added/removed/changed
   merge.py       # base/left/right 三路合并：对象成员递归、数组原子、规范相等、RFC 6901 排序冲突
-  patch.py       # RFC 6902 add/remove/replace 引擎（有序执行、整体校验、changedPaths）
+  patch.py       # RFC 6902 add/remove/replace 引擎（有序执行、整体校验、changedPaths、逆操作记录）
   redact.py      # 叶级脱敏引擎：RFC 6901 片段（字面量/*/**）匹配、mask/drop、规则优先级
   shape.py       # 结构清单与自底向上同形哈希（域标签 + 长度前缀，标量值不参与）
   tree.py        # 叶展开、叶哈希/节点哈希、排序建树、标准与紧凑证明
@@ -847,7 +1004,7 @@ app/
   canonical.py   # 规范 JSON 序列化
   jsonio.py      # 严格 JSON 解析（拒绝重复键、错误定位）
   validation.py  # 提交值校验（非有限数、非 JSON 类型等）
-  openapi.py     # 两种证明格式与 /diff、/patch 的 OpenAPI 模型与文档合并
+  openapi.py     # 两种证明格式与 /diff、/patch、/patch/undo 的 OpenAPI 模型与文档合并
   errors.py      # 带 code/loc 的 API 错误类型
 tests/           # 哈希/树单元测试 + API 端到端（含全部篡改、去重、结构错误与补丁场景）
 Dockerfile

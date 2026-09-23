@@ -17,6 +17,11 @@ Array semantics follow RFC 6902:
 Every failure raises :class:`~app.errors.ApiError` whose ``loc`` pins the
 fault at ``operations[i]`` (or one of its fields), matching the error body
 of the other endpoints.
+
+With ``with_undo=True`` :func:`apply_patch` additionally records the
+inverse of every step — the target state observed *before* that step — and
+returns the inverses in reverse application order, ready to be handed back
+to :func:`apply_patch` to restore the original document.
 """
 
 from __future__ import annotations
@@ -183,16 +188,33 @@ def _target_key(
     )
 
 
-def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
-    """Apply a single parsed operation; returns the (possibly new) document."""
+def _apply_one(
+    doc: Any,
+    operation: _Operation,
+    index: int,
+    inverses: List[Dict[str, Any]] | None = None,
+) -> Any:
+    """Apply a single parsed operation; returns the (possibly new) document.
+
+    When *inverses* is supplied, the inverse of this step is appended to it
+    in forward order.  The inverse is captured from the target state
+    observed *before* the mutation (after every legality check has passed),
+    so a failed step never records a partial inverse.
+    """
 
     loc = f"operations[{index}]"
+
+    def record(inverse: Dict[str, Any]) -> None:
+        if inverses is not None:
+            inverses.append(inverse)
 
     # Operations on the whole document: only add/replace are permitted —
     # RFC 6902 reserves an empty-path remove for an implementation-defined
     # root removal that would leave no document.
     if len(operation.tokens) == 0:
         if operation.op in ("add", "replace"):
+            # Restore the previous whole document, whatever it was.
+            record({"op": "replace", "path": "", "value": copy.deepcopy(doc)})
             return copy.deepcopy(operation.value)
         raise ApiError(
             INVALID_REQUEST,
@@ -206,9 +228,30 @@ def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
     key, idx = _target_key(
         parent, operation, index, allow_end=operation.op == "add"
     )
+    # The inverse re-targets the same slot via the parent pointer, rebuilt
+    # with canonical ~0/~1 escaping and a real numeric array index.
+    parent_pointer = "".join(
+        "/" + str(token).replace("~", "~0").replace("/", "~1")
+        for token in operation.tokens[:-1]
+    )
 
     if isinstance(parent, dict):
         if operation.op == "add":
+            if key in parent:
+                # Adding an existing member replaces it (RFC 6902 4.1); the
+                # inverse restores the previous value rather than deleting.
+                record(
+                    {
+                        "op": "replace",
+                        "path": pointers.build_pointer(
+                            parent_pointer, key
+                        ),
+                        "value": copy.deepcopy(parent[key]),
+                    }
+                )
+            else:
+                record({"op": "remove",
+                        "path": pointers.build_pointer(parent_pointer, key)})
             # Adding an existing member replaces it (RFC 6902 4.1).
             parent[key] = copy.deepcopy(operation.value)
         elif operation.op == "remove":
@@ -220,6 +263,13 @@ def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
                     loc=loc,
                     detail={"path": operation.path},
                 )
+            record(
+                {
+                    "op": "add",
+                    "path": pointers.build_pointer(parent_pointer, key),
+                    "value": copy.deepcopy(parent[key]),
+                }
+            )
             del parent[key]
         else:  # replace
             if key not in parent:
@@ -230,6 +280,13 @@ def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
                     loc=loc,
                     detail={"path": operation.path},
                 )
+            record(
+                {
+                    "op": "replace",
+                    "path": pointers.build_pointer(parent_pointer, key),
+                    "value": copy.deepcopy(parent[key]),
+                }
+            )
             parent[key] = copy.deepcopy(operation.value)
         return doc
 
@@ -239,7 +296,7 @@ def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
         # idx == -1 (the "-" token) appends; a numeric index may be equal to
         # the current length, also an append (insert position length).
         if idx == -1:
-            parent.append(copy.deepcopy(operation.value))
+            insert_at = length
         elif idx > length:
             raise ApiError(
                 PATH_NOT_FOUND,
@@ -249,7 +306,19 @@ def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
                 detail={"path": operation.path},
             )
         else:
-            parent.insert(idx, copy.deepcopy(operation.value))
+            insert_at = idx
+        # The inverse removes the inserted element at its concrete numeric
+        # position — '-' is never emitted back, so undo needs no token.
+        record(
+            {
+                "op": "remove",
+                "path": pointers.build_pointer(parent_pointer, insert_at),
+            }
+        )
+        if idx == -1:
+            parent.append(copy.deepcopy(operation.value))
+        else:
+            parent.insert(insert_at, copy.deepcopy(operation.value))
     elif operation.op == "remove":
         if idx is None or not 0 <= idx < length:
             raise ApiError(
@@ -259,6 +328,13 @@ def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
                 loc=loc,
                 detail={"path": operation.path},
             )
+        record(
+            {
+                "op": "add",
+                "path": pointers.build_pointer(parent_pointer, idx),
+                "value": copy.deepcopy(parent[idx]),
+            }
+        )
         del parent[idx]
     else:  # replace
         if idx is None or not 0 <= idx < length:
@@ -269,12 +345,19 @@ def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
                 loc=loc,
                 detail={"path": operation.path},
             )
+        record(
+            {
+                "op": "replace",
+                "path": pointers.build_pointer(parent_pointer, idx),
+                "value": copy.deepcopy(parent[idx]),
+            }
+        )
         parent[idx] = copy.deepcopy(operation.value)
     return doc
 
 
 def apply_patch(
-    document: Any, raw_operations: Any
+    document: Any, raw_operations: Any, *, with_undo: bool = False
 ) -> Dict[str, Any]:
     """Validate and apply an RFC 6902-style patch to a deep copy.
 
@@ -286,6 +369,12 @@ def apply_patch(
     ``changedPaths`` is the symmetric difference of both documents' RFC 6901
     leaf paths (leaves present on one side only, or present on both with
     different canonical values), sorted by pointer.
+
+    With ``with_undo=True`` the result additionally carries
+    ``"undoOperations"``: one inverse operation per applied step, recorded
+    from each step's pre-execution target state and returned in **reverse**
+    step order.  Applying them to ``patched`` via another /patch call
+    restores a document equal to the input.
     """
 
     if not isinstance(raw_operations, list):
@@ -304,9 +393,18 @@ def apply_patch(
     # Pass 2: apply in order on a private copy.  Each operation is checked
     # against the document state produced by its predecessors; on failure the
     # mutated copy is discarded and no partial result leaves the service.
+    # The inverse of every applied step is appended in forward order, then
+    # reversed below so the caller can feed the list straight back to /patch.
     patched = copy.deepcopy(document)
+    forward_inverses: List[Dict[str, Any]] = [] if with_undo else None  # type: ignore[assignment]
     for i, operation in enumerate(operations):
-        patched = _apply_one(patched, operation, i)
+        patched = _apply_one(
+            patched, operation, i, forward_inverses
+        )
+
+    result: Dict[str, Any] = {}
+    if with_undo:
+        result["undoOperations"] = list(reversed(forward_inverses or []))
 
     before = leaf_facts(document)
     after = leaf_facts(patched)
@@ -319,4 +417,6 @@ def apply_patch(
             or before[path].fingerprint != after[path].fingerprint
         )
     )
-    return {"document": patched, "changedPaths": changed}
+    result["document"] = patched
+    result["changedPaths"] = changed
+    return result

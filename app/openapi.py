@@ -285,6 +285,27 @@ class PatchResponse(BaseModel):
     )
 
 
+class PatchUndoResponse(PatchResponse):
+    undoOperations: List[PatchOperation] = Field(
+        ...,
+        description=(
+            "The inverse of each applied operation, one per step, ordered "
+            "for immediate replay: the inverse of the last applied step "
+            "comes first. Each entry is a normal /patch operation "
+            "(add/remove/replace) captured from the target state *before* "
+            "that step ran — array 'add' (including the '-' end token) is "
+            "undone by a 'remove' at the concrete numeric insertion index, "
+            "an 'add' over an existing object member is undone by a "
+            "'replace' with the old value, and an empty-path root "
+            "add/replace is undone by replacing the root with the previous "
+            "whole document. POSTing {document: <this response's document>, "
+            "operations: undoOperations} to /patch restores the original "
+            "document. An empty input operations list yields an empty "
+            "undoOperations list."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Deterministic leaf redaction
 # ---------------------------------------------------------------------------
@@ -546,6 +567,7 @@ def install_openapi(app: FastAPI) -> None:
                 PatchOperation,
                 PatchRequest,
                 PatchResponse,
+                PatchUndoResponse,
                 RedactRule,
                 RedactRequest,
                 AppliedRedaction,
@@ -845,6 +867,95 @@ def install_openapi(app: FastAPI) -> None:
                                     "/role",
                                     "/subject/age",
                                     "/subject/title",
+                                ],
+                            },
+                        ),
+                    },
+                    **error_responses,
+                },
+            }
+        }
+
+        generated["paths"]["/patch/undo"] = {
+            "post": {
+                "summary": "Apply RFC 6902 operations and return their replayable undo",
+                "description": (
+                    "Takes the exact same `{document, operations}` request "
+                    "as /patch and applies it with the same ordered "
+                    "semantics and the same atomic validation — any invalid "
+                    "step fails the whole request with a `loc` of "
+                    "`operations[i]` and no partial result is returned. On "
+                    "success the response carries the patched document and "
+                    "`changedPaths` exactly like /patch, plus "
+                    "`undoOperations`: the inverse of every applied step, "
+                    "recorded from the target state observed before that "
+                    "step and listed in reverse step order. The list is "
+                    "ready to POST straight back to /patch as "
+                    "`{document: <patched document>, operations: "
+                    "undoOperations}`, which restores the original "
+                    "document. Array additions are reversed at their "
+                    "concrete numeric insertion index (the '-' append token "
+                    "never appears in an undo op); an `add` that replaced "
+                    "an existing object member reverses into a `replace` "
+                    "carrying the old value; a root-path add/replace "
+                    "reverses into an empty-pointer `replace` with the "
+                    "previous whole document as its value."
+                ),
+                "operationId": "patchUndo",
+                "requestBody": _json_content(
+                    _ref("PatchRequest"),
+                    example={
+                        "document": {
+                            "subject": {"name": "Ada", "age": 36},
+                            "emails": ["ada@example.com"],
+                            "role": None,
+                        },
+                        "operations": [
+                            {"op": "replace", "path": "/subject/age",
+                             "value": 37},
+                            {"op": "add", "path": "/emails/-",
+                             "value": "ada@analytical.engine"},
+                            {"op": "add", "path": "/subject/title",
+                             "value": "Countess"},
+                            {"op": "remove", "path": "/role"},
+                        ],
+                    },
+                ),
+                "responses": {
+                    "200": {
+                        "description": (
+                            "Patched document, changed leaf paths and "
+                            "reverse-order undo operations that replay "
+                            "through /patch to restore the input document."
+                        ),
+                        **_json_content(
+                            _ref("PatchUndoResponse"),
+                            example={
+                                "document": {
+                                    "subject": {
+                                        "name": "Ada",
+                                        "age": 37,
+                                        "title": "Countess",
+                                    },
+                                    "emails": [
+                                        "ada@example.com",
+                                        "ada@analytical.engine",
+                                    ],
+                                },
+                                "changedPaths": [
+                                    "/emails/1",
+                                    "/role",
+                                    "/subject/age",
+                                    "/subject/title",
+                                ],
+                                "undoOperations": [
+                                    {"op": "add", "path": "/role",
+                                     "value": None},
+                                    {"op": "remove",
+                                     "path": "/subject/title"},
+                                    {"op": "remove", "path": "/emails/1"},
+                                    {"op": "replace", "path": "/subject/age",
+                                     "value": 36},
                                 ],
                             },
                         ),
