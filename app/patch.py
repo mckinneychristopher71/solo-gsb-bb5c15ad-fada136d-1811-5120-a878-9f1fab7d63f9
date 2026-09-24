@@ -17,6 +17,11 @@ Array semantics follow RFC 6902:
 Every failure raises :class:`~app.errors.ApiError` whose ``loc`` pins the
 fault at ``operations[i]`` (or one of its fields), matching the error body
 of the other endpoints.
+
+:func:`apply_patch_with_undo` additionally records, for every forward step,
+an inverse operation that restores the exact pre-step target state; the
+inverse list is returned in reverse order so it can be replayed through
+``/patch`` to roll the patched document back to the original.
 """
 
 from __future__ import annotations
@@ -183,8 +188,28 @@ def _target_key(
     )
 
 
-def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
-    """Apply a single parsed operation; returns the (possibly new) document."""
+def _encode_pointer(prefix: str, token: Any) -> str:
+    """Append one reference token to *prefix* using RFC 6901 escapes."""
+    raw = str(token).replace("~", "~0").replace("/", "~1")
+    return prefix + "/" + raw
+
+
+def _parent_pointer(operation: _Operation) -> str:
+    """RFC 6901 pointer of the operation's parent container."""
+    pointer = ""
+    for token in operation.tokens[:-1]:
+        pointer = _encode_pointer(pointer, token)
+    return pointer
+
+
+def _apply_one(doc: Any, operation: _Operation, index: int) -> Tuple[Any, Dict[str, Any]]:
+    """Apply a single parsed operation.
+
+    Returns ``(new_doc, inverse)`` where *inverse* is a JSON-serializable
+    RFC 6902 operation that restores the target to its exact pre-step state.
+    The inverse is valid against the document state produced by this step;
+    callers replay the collected inverses in reverse order.
+    """
 
     loc = f"operations[{index}]"
 
@@ -193,7 +218,10 @@ def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
     # root removal that would leave no document.
     if len(operation.tokens) == 0:
         if operation.op in ("add", "replace"):
-            return copy.deepcopy(operation.value)
+            # Restoring the previous whole document is always a root
+            # add/replace of the deep-copied pre-step root.
+            inverse = {"op": "add", "path": "", "value": copy.deepcopy(doc)}
+            return copy.deepcopy(operation.value), inverse
         raise ApiError(
             INVALID_REQUEST,
             "cannot remove the entire document: the root pointer '' is not "
@@ -209,7 +237,17 @@ def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
 
     if isinstance(parent, dict):
         if operation.op == "add":
-            # Adding an existing member replaces it (RFC 6902 4.1).
+            # Adding an existing member replaces it (RFC 6902 4.1). The
+            # inverse restores the old value; a member that did not exist is
+            # removed instead.
+            if key in parent:
+                inverse = {
+                    "op": "add",
+                    "path": operation.path,
+                    "value": copy.deepcopy(parent[key]),
+                }
+            else:
+                inverse = {"op": "remove", "path": operation.path}
             parent[key] = copy.deepcopy(operation.value)
         elif operation.op == "remove":
             if key not in parent:
@@ -220,6 +258,11 @@ def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
                     loc=loc,
                     detail={"path": operation.path},
                 )
+            inverse = {
+                "op": "add",
+                "path": operation.path,
+                "value": copy.deepcopy(parent[key]),
+            }
             del parent[key]
         else:  # replace
             if key not in parent:
@@ -230,8 +273,13 @@ def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
                     loc=loc,
                     detail={"path": operation.path},
                 )
+            inverse = {
+                "op": "replace",
+                "path": operation.path,
+                "value": copy.deepcopy(parent[key]),
+            }
             parent[key] = copy.deepcopy(operation.value)
-        return doc
+        return doc, inverse
 
     # Array parent.
     length = len(parent)
@@ -239,6 +287,7 @@ def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
         # idx == -1 (the "-" token) appends; a numeric index may be equal to
         # the current length, also an append (insert position length).
         if idx == -1:
+            insert_at = length
             parent.append(copy.deepcopy(operation.value))
         elif idx > length:
             raise ApiError(
@@ -249,7 +298,14 @@ def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
                 detail={"path": operation.path},
             )
         else:
-            parent.insert(idx, copy.deepcopy(operation.value))
+            insert_at = idx
+            parent.insert(insert_at, copy.deepcopy(operation.value))
+        # Undo an insertion by removing the element at the concrete numeric
+        # position it actually landed at ('-' never appears in the inverse).
+        inverse = {
+            "op": "remove",
+            "path": _encode_pointer(_parent_pointer(operation), insert_at),
+        }
     elif operation.op == "remove":
         if idx is None or not 0 <= idx < length:
             raise ApiError(
@@ -259,7 +315,15 @@ def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
                 loc=loc,
                 detail={"path": operation.path},
             )
+        removed = parent[idx]
         del parent[idx]
+        # Re-insert the removed element at its original numeric position; an
+        # 'add' at that index shifts the later elements back into place.
+        inverse = {
+            "op": "add",
+            "path": _encode_pointer(_parent_pointer(operation), idx),
+            "value": copy.deepcopy(removed),
+        }
     else:  # replace
         if idx is None or not 0 <= idx < length:
             raise ApiError(
@@ -269,23 +333,25 @@ def _apply_one(doc: Any, operation: _Operation, index: int) -> Any:
                 loc=loc,
                 detail={"path": operation.path},
             )
+        inverse = {
+            "op": "replace",
+            "path": operation.path,
+            "value": copy.deepcopy(parent[idx]),
+        }
         parent[idx] = copy.deepcopy(operation.value)
-    return doc
+    return doc, inverse
 
 
-def apply_patch(
+def _parse_and_apply(
     document: Any, raw_operations: Any
-) -> Dict[str, Any]:
-    """Validate and apply an RFC 6902-style patch to a deep copy.
+) -> Tuple[Any, List[Dict[str, Any]], List[_Operation]]:
+    """Validate all envelopes, then apply them in order to a deep copy.
 
-    Every operation envelope is validated before the document is touched, so
-    a structural error never produces partial output; semantic failures are
-    detected in order and are likewise reported before a response is built.
-
-    Returns ``{"document": patched, "changedPaths": [...]}`` where
-    ``changedPaths`` is the symmetric difference of both documents' RFC 6901
-    leaf paths (leaves present on one side only, or present on both with
-    different canonical values), sorted by pointer.
+    Returns the patched document, one recorded inverse per applied step (in
+    forward order) and the parsed operations. Every operation envelope is
+    validated before the document is touched, so a structural error never
+    produces partial output; semantic failures are detected in order and the
+    mutated copy is discarded.
     """
 
     if not isinstance(raw_operations, list):
@@ -305,8 +371,29 @@ def apply_patch(
     # against the document state produced by its predecessors; on failure the
     # mutated copy is discarded and no partial result leaves the service.
     patched = copy.deepcopy(document)
+    inverses: List[Dict[str, Any]] = []
     for i, operation in enumerate(operations):
-        patched = _apply_one(patched, operation, i)
+        patched, inverse = _apply_one(patched, operation, i)
+        inverses.append(inverse)
+    return patched, inverses, operations
+
+
+def apply_patch(
+    document: Any, raw_operations: Any
+) -> Dict[str, Any]:
+    """Validate and apply an RFC 6902-style patch to a deep copy.
+
+    Every operation envelope is validated before the document is touched, so
+    a structural error never produces partial output; semantic failures are
+    detected in order and are likewise reported before a response is built.
+
+    Returns ``{"document": patched, "changedPaths": [...]}`` where
+    ``changedPaths`` is the symmetric difference of both documents' RFC 6901
+    leaf paths (leaves present on one side only, or present on both with
+    different canonical values), sorted by pointer.
+    """
+
+    patched, _inverses, _operations = _parse_and_apply(document, raw_operations)
 
     before = leaf_facts(document)
     after = leaf_facts(patched)
@@ -320,3 +407,35 @@ def apply_patch(
         )
     )
     return {"document": patched, "changedPaths": changed}
+
+
+def apply_patch_with_undo(
+    document: Any, raw_operations: Any
+) -> Dict[str, Any]:
+    """Apply a patch and return it together with replayable undo operations.
+
+    This runs the exact same validation and ordered application as
+    :func:`apply_patch` (so every failure carries the same
+    ``operations[i]``-located error and no partial result is returned), and
+    additionally records each forward step's pre-step target state.
+
+    Returns ``{"document": patched, "undoOperations": [...]}`` where
+    ``undoOperations`` is the per-step inverse list in **reverse** order, so
+    submitting it as the ``operations`` of ``/patch`` with the patched
+    document restores the original document byte-for-byte (canonically).
+
+    Inverse details:
+
+    * an array ``add`` (including the ``-`` end token) is undone with a
+      ``remove`` at the concrete numeric index the value was inserted at;
+    * an array ``remove`` is undone with an ``add`` of the removed value at
+      the original numeric index;
+    * an object ``add`` of a new member is undone with ``remove``; an
+      ``add``/``replace`` over an existing member is undone by restoring the
+      previous value;
+    * a root-path (``""``) add/replace is undone by restoring the previous
+      whole document.
+    """
+
+    patched, inverses, _operations = _parse_and_apply(document, raw_operations)
+    return {"document": patched, "undoOperations": list(reversed(inverses))}

@@ -15,6 +15,9 @@ POST /diff     compare two documents at their RFC 6901 leaf paths and report
 POST /patch    apply an ordered list of RFC 6902 operations (add, remove,
                replace) to a deep copy of a document; returns the patched
                document together with the sorted changed leaf paths.
+POST /patch/undo  same request as /patch; returns the patched document plus
+               `undoOperations` in reverse order that, replayed through
+               /patch, restore the original document.
 POST /redact   deterministically mask or drop JSON leaves selected by RFC
                6901 fragment patterns (literals, '*' and '**' wildcards);
                returns the redacted document and the path-sorted applied
@@ -45,7 +48,7 @@ from . import pointers
 from .canonical import CanonicalError
 from .diff import diff_documents
 from .merge import merge_documents
-from .patch import apply_patch
+from .patch import apply_patch, apply_patch_with_undo
 from .redact import redact_document
 from .shape import shape_manifest
 from .errors import (
@@ -489,6 +492,28 @@ async def patch_document_endpoint(request: Request) -> Dict[str, Any]:
     operations = _get_field(body, "operations", "operations")
 
     return apply_patch(document, operations)
+
+
+# ---------------------------------------------------------------------------
+# POST /patch/undo
+# ---------------------------------------------------------------------------
+
+
+@app.post("/patch/undo")
+async def patch_undo_endpoint(request: Request) -> Dict[str, Any]:
+    body = await _read_json_body(request)
+    if not isinstance(body, dict):
+        raise ApiError(
+            INVALID_REQUEST,
+            "request body must be a JSON object",
+            loc="body",
+        )
+
+    document = _get_field(body, "document", "document")
+    validate_json_value(document, loc="document")
+    operations = _get_field(body, "operations", "operations")
+
+    return apply_patch_with_undo(document, operations)
 
 
 # ---------------------------------------------------------------------------
@@ -1071,6 +1096,7 @@ async def index() -> Dict[str, Any]:
             "verify": "POST /verify",
             "diff": "POST /diff",
             "patch": "POST /patch",
+            "patchUndo": "POST /patch/undo",
             "redact": "POST /redact",
             "shape": "POST /shape",
             "merge": "POST /merge",

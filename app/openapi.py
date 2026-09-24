@@ -285,6 +285,24 @@ class PatchResponse(BaseModel):
     )
 
 
+class PatchUndoResponse(BaseModel):
+    document: Any = Field(..., description="The patched JSON document.")
+    undoOperations: List[PatchOperation] = Field(
+        ...,
+        description=(
+            "RFC 6902 operations that roll the patched document back to the "
+            "exact original document. They are the inverse of each forward "
+            "step, listed in reverse order, and can be POSTed unchanged to "
+            "/patch with `document` set to this response's `document`. "
+            "An array `add` (including the '-' token) is undone by a "
+            "`remove` at the concrete numeric insertion index; an object "
+            "`add` over an existing member (and any `replace`) restores the "
+            "previous value; a root-path add/replace restores the previous "
+            "whole document. Empty when the input operations were empty."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Deterministic leaf redaction
 # ---------------------------------------------------------------------------
@@ -546,6 +564,7 @@ def install_openapi(app: FastAPI) -> None:
                 PatchOperation,
                 PatchRequest,
                 PatchResponse,
+                PatchUndoResponse,
                 RedactRule,
                 RedactRequest,
                 AppliedRedaction,
@@ -845,6 +864,87 @@ def install_openapi(app: FastAPI) -> None:
                                     "/role",
                                     "/subject/age",
                                     "/subject/title",
+                                ],
+                            },
+                        ),
+                    },
+                    **error_responses,
+                },
+            }
+        }
+
+        generated["paths"]["/patch/undo"] = {
+            "post": {
+                "summary": "Apply a patch and return reverse undo operations",
+                "description": (
+                    "Accepts the same `document` and `operations` request as "
+                    "/patch and applies them with identical validation and "
+                    "ordering, so any failure is reported exactly as /patch "
+                    "would (a `loc` of `operations[i]`) with no partial "
+                    "result. Before every forward step the target's prior "
+                    "state is recorded: an array `add` (including the '-' "
+                    "end token) is inverted by a `remove` at the actual "
+                    "numeric index it landed at; an array `remove` is "
+                    "inverted by re-adding the removed value at its index; "
+                    "an object `add` of a new member becomes `remove`, "
+                    "while an `add`/`replace` over an existing member "
+                    "restores the old value; `replace` always restores the "
+                    "old value; and a root-path ('') add/replace restores "
+                    "the previous whole document. The response's "
+                    "`undoOperations` are these inverses in reverse order "
+                    "and can be submitted unchanged to /patch with "
+                    "`document` set to the returned patched document to "
+                    "recover the original document."
+                ),
+                "operationId": "patch_undo",
+                "requestBody": _json_content(
+                    _ref("PatchRequest"),
+                    example={
+                        "document": {
+                            "subject": {"name": "Ada", "age": 36},
+                            "emails": ["ada@example.com"],
+                            "role": None,
+                        },
+                        "operations": [
+                            {"op": "replace", "path": "/subject/age",
+                             "value": 37},
+                            {"op": "add", "path": "/emails/-",
+                             "value": "ada@analytical.engine"},
+                            {"op": "add", "path": "/subject/title",
+                             "value": "Countess"},
+                            {"op": "remove", "path": "/role"},
+                        ],
+                    },
+                ),
+                "responses": {
+                    "200": {
+                        "description": (
+                            "Patched document and reverse-order RFC 6902 "
+                            "operations that restore the original when "
+                            "replayed via /patch."
+                        ),
+                        **_json_content(
+                            _ref("PatchUndoResponse"),
+                            example={
+                                "document": {
+                                    "subject": {
+                                        "name": "Ada",
+                                        "age": 37,
+                                        "title": "Countess",
+                                    },
+                                    "emails": [
+                                        "ada@example.com",
+                                        "ada@analytical.engine",
+                                    ],
+                                },
+                                "undoOperations": [
+                                    {"op": "add", "path": "/role",
+                                     "value": None},
+                                    {"op": "remove",
+                                     "path": "/subject/title"},
+                                    {"op": "remove", "path": "/emails/1"},
+                                    {"op": "replace", "path": "/subject/age",
+                                     "value": 36},
                                 ],
                             },
                         ),
